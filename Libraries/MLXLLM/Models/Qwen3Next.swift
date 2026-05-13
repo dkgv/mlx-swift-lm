@@ -663,6 +663,36 @@ public struct Qwen3NextConfiguration: Codable, Sendable {
     }
 }
 
+extension Qwen3NextModel: PipelineShardableLanguageModel {
+    public var pipelineShardEmbedTokens: Embedding {
+        model.embedTokens
+    }
+
+    public var pipelineShardLayers: [PipelineShardLayer] {
+        model.layers.map { layer in
+            PipelineShardLayer(
+                module: layer,
+                cacheKind: layer.isLinear ? .mamba : .kv
+            ) { x, attentionMask, ssmMask, cache in
+                layer(
+                    x,
+                    attentionMask: layer.isLinear ? .none : attentionMask,
+                    ssmMask: layer.isLinear ? ssmMask : nil,
+                    cache: cache
+                )
+            }
+        }
+    }
+
+    public var pipelineShardNorm: RMSNorm {
+        model.norm
+    }
+
+    public var pipelineShardLMHead: Linear? {
+        lmHead
+    }
+}
+
 // MARK: - LoRA
 
 extension Qwen3NextModel: LoRAModel {

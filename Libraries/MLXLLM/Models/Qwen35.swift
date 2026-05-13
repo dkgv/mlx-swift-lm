@@ -632,6 +632,36 @@ extension Qwen35TextModel: LoRAModel {
     }
 }
 
+extension Qwen35TextModel: PipelineShardableLanguageModel {
+    public var pipelineShardEmbedTokens: Embedding {
+        model.embedTokens
+    }
+
+    public var pipelineShardLayers: [PipelineShardLayer] {
+        model.layers.map { layer in
+            PipelineShardLayer(
+                module: layer,
+                cacheKind: layer.isLinear ? .mamba : .kv
+            ) { x, attentionMask, ssmMask, cache in
+                layer(
+                    x,
+                    attentionMask: layer.isLinear ? .none : attentionMask,
+                    ssmMask: layer.isLinear ? ssmMask : nil,
+                    cache: cache
+                )
+            }
+        }
+    }
+
+    public var pipelineShardNorm: RMSNorm {
+        model.norm
+    }
+
+    public var pipelineShardLMHead: Linear? {
+        lmHead
+    }
+}
+
 // MARK: - Top-level Model
 
 public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
@@ -679,5 +709,29 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 extension Qwen35Model: LoRAModel {
     public var loraLayers: [Module] {
         languageModel.model.layers
+    }
+}
+
+extension Qwen35Model: PipelineShardableLanguageModel {
+    public var pipelineShardEmbedTokens: Embedding {
+        languageModel.pipelineShardEmbedTokens
+    }
+
+    public var pipelineShardLayers: [PipelineShardLayer] {
+        languageModel.pipelineShardLayers
+    }
+
+    public var pipelineShardNorm: RMSNorm {
+        languageModel.pipelineShardNorm
+    }
+
+    public var pipelineShardLMHead: Linear? {
+        languageModel.pipelineShardLMHead
+    }
+
+    public func pipelineShardSSMMask(
+        hiddenStates: MLXArray, cache: (any KVCache)?
+    ) -> MLXArray? {
+        languageModel.pipelineShardSSMMask(hiddenStates: hiddenStates, cache: cache)
     }
 }
