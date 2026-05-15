@@ -510,6 +510,35 @@ public final class LLMModelFactory: GenericModelFactory {
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
     ) async throws -> ModelContext {
+        try await _loadImpl(
+            configuration: configuration, tokenizerLoader: tokenizerLoader, shard: nil)
+    }
+
+    /// Shard-aware load: only assigns and materialises weights belonging to `shard`.
+    ///
+    /// - Parameter shard: The pipeline slice this device owns. Pass `nil` to load the
+    ///   full model (equivalent to the standard `_load` path).
+    public func load(
+        from downloader: any Downloader,
+        using tokenizerLoader: any TokenizerLoader,
+        configuration: ModelConfiguration,
+        shard: ShardSpec,
+        progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
+    ) async throws -> sending ModelContext {
+        let resolved = try await resolve(
+            configuration: configuration, from: downloader,
+            useLatest: false, progressHandler: progressHandler)
+        return try await _loadImpl(
+            configuration: resolved, tokenizerLoader: tokenizerLoader, shard: shard)
+    }
+
+    // MARK: - Internal
+
+    private func _loadImpl(
+        configuration: ResolvedModelConfiguration,
+        tokenizerLoader: any TokenizerLoader,
+        shard: ShardSpec?
+    ) async throws -> ModelContext {
         let modelDirectory = configuration.modelDirectory
 
         // Load config.json once and decode for both base config and model-specific config
@@ -561,9 +590,14 @@ public final class LLMModelFactory: GenericModelFactory {
         async let tokenizerTask = tokenizerLoader.load(
             from: configuration.tokenizerDirectory)
 
+        let keyFilter = shard.map {
+            makeShardKeyFilter(shard: $0, tieWordEmbeddings: baseConfig.tieWordEmbeddings ?? false)
+        }
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization)
+            perLayerQuantization: baseConfig.perLayerQuantization,
+            keyFilter: keyFilter,
+            skipEval: shard != nil)
 
         let tokenizer = try await tokenizerTask
 
@@ -596,6 +630,38 @@ public final class LLMModelFactory: GenericModelFactory {
             tokenizer: tokenizer)
     }
 
+}
+
+// MARK: - Shard key filter
+
+/// Returns a predicate that admits only weight keys belonging to `shard`.
+///
+/// Rules (applied in order; anything not matched by a named rule passes through):
+///
+/// | Key prefix                   | Included when                                      |
+/// |------------------------------|----------------------------------------------------|
+/// | `model.layers.N.*`           | N ∈ [startLayer, endLayer)                         |
+/// | `model.embed_tokens.*`       | ownsEmbed OR (ownsLMHead AND tieWordEmbeddings)    |
+/// | `model.norm.*` / `model.norm`| ownsLMHead                                         |
+/// | `lm_head.*`                  | ownsLMHead AND NOT tieWordEmbeddings               |
+/// | anything else                | always (permissive default)                        |
+private func makeShardKeyFilter(shard: ShardSpec, tieWordEmbeddings: Bool) -> (String) -> Bool {
+    let keepEmbed = shard.ownsEmbed || (shard.ownsLMHead && tieWordEmbeddings)
+    return { key in
+        // model.layers.N.* — only keep shard-owned layer indices
+        if key.hasPrefix("model.layers.") {
+            let rest = key.dropFirst("model.layers.".count)
+            if let dot = rest.firstIndex(of: "."),
+               let idx = Int(rest[rest.startIndex..<dot])
+            {
+                return idx >= shard.startLayer && idx < shard.endLayer
+            }
+        }
+        if key.hasPrefix("model.embed_tokens.") { return keepEmbed }
+        if key.hasPrefix("model.norm.") || key == "model.norm" { return shard.ownsLMHead }
+        if key.hasPrefix("lm_head.") { return shard.ownsLMHead && !tieWordEmbeddings }
+        return true
+    }
 }
 
 public class TrampolineModelFactory: NSObject, ModelFactoryTrampoline {

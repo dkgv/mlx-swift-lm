@@ -11,10 +11,21 @@ import MLXNN
 /// calls ``BaseLanguageModel/sanitize(weights:metadata:)`` to allow per-model preprocessing,
 /// applies optional quantization, and
 /// updates the model with the weights.
+///
+/// - Parameters:
+///   - keyFilter: When provided, only weight keys satisfying the predicate are assigned to
+///     the model. Non-matching keys are discarded after loading; the corresponding
+///     parameters remain as lazy, un-evaluated init tensors. Pass `nil` (the default) for
+///     a full-model load.
+///   - skipEval: When `true`, the final `eval(model)` is omitted. The caller is responsible
+///     for evaluating whichever parameters it needs. Use with `keyFilter` so that only the
+///     relevant parameters are ever materialised.
 public func loadWeights(
     modelDirectory: URL, model: BaseLanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
-    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    keyFilter: ((String) -> Bool)? = nil,
+    skipEval: Bool = false
 ) throws {
     // load the weights and collect metadata from the first safetensor file
     var weights = [String: MLXArray]()
@@ -36,6 +47,11 @@ public func loadWeights(
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
 
+    // drop keys outside this shard before quantizing and updating the model
+    if let keyFilter {
+        weights = weights.filter { keyFilter($0.key) }
+    }
+
     // quantize if needed
     if quantization != nil || perLayerQuantization != nil {
         quantize(model: model) { path, module in
@@ -51,9 +67,12 @@ public func loadWeights(
         }
     }
 
-    // apply the loaded weights
+    // apply the loaded weights; when a filter is active not all model keys will be present,
+    // so relax verification to only check that every key in the dict matched a parameter
     let parameters = ModuleParameters.unflattened(weights)
-    try model.update(parameters: parameters, verify: [.all])
+    try model.update(parameters: parameters, verify: keyFilter == nil ? [.all] : .noUnusedKeys)
 
-    eval(model)
+    if !skipEval {
+        eval(model)
+    }
 }

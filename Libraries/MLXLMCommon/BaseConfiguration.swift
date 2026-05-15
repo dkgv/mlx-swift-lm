@@ -191,6 +191,10 @@ public struct BaseConfiguration: Codable, Sendable {
     /// EOS token IDs from config.json. Can be a single Int or an array of Ints.
     public var eosTokenIds: IntOrIntArray?
 
+    /// Whether the embedding matrix is reused (transposed) as the LM-head projection.
+    /// Absent in many configs; defaults to false.
+    public var tieWordEmbeddings: Bool?
+
     /// The default quantization settings.
     @available(*, deprecated, message: "Please use perLayerQuantization instead")
     public var quantization: Quantization? {
@@ -206,5 +210,6 @@ public struct BaseConfiguration: Codable, Sendable {
         case modelType = "model_type"
         case quantizationContainer = "quantization"
         case eosTokenIds = "eos_token_id"
+        case tieWordEmbeddings = "tie_word_embeddings"
     }
 }
