@@ -82,6 +82,24 @@ private func gemma4OneHot(_ indices: MLXArray, numClasses: Int) -> MLXArray {
     expandedDimensions(indices, axis: -1) .== MLXArray(0 ..< numClasses)
 }
 
+/// Average-pool kernel for Gemma 4's vision pooler.
+///
+/// The padded patch tensor has length
+/// `paddedPatchCount = outputLength × pool²` where `pool` is the
+/// model's `pooling_kernel_size`. Recovering `pool` from these
+/// two values yields `floor(sqrt(paddedPatchCount / outputLength))`.
+///
+/// Matches HuggingFace's reference image processor (see
+/// `image_processing_gemma4.py`: `max_patches = max_soft_tokens *
+/// pooling_kernel_size**2`).
+internal func gemma4VisionPoolingKernel(
+    paddedPatchCount: Int, outputLength: Int
+) -> Int {
+    let safeLength = max(outputLength, 1)
+    let ratio = max(1, paddedPatchCount / safeLength)
+    return Int(sqrt(Double(ratio)))
+}
+
 private func gemma4RotateHalf(_ x: MLXArray) -> MLXArray {
     let half = x.shape[x.shape.count - 1] / 2
     let x1 = x[.ellipsis, ..<half]
@@ -165,26 +183,6 @@ private func gemma4EnsureFusedSDPA(
     return MLXFast.scaledDotProductAttention(
         queries: paddedQueries, keys: paddedKeys, values: paddedValues, scale: scale, mask: mask
     )[.ellipsis, ..<d]
-}
-
-private enum Gemma4SharedKVState {
-    case regular(keys: MLXArray, values: MLXArray)
-    case quantized(
-        keys: (MLXArray, MLXArray, MLXArray?),
-        values: (MLXArray, MLXArray, MLXArray?),
-        groupSize: Int,
-        bits: Int,
-        mode: QuantizationMode
-    )
-
-    var sequenceLength: Int {
-        switch self {
-        case .regular(let keys, _):
-            return keys.dim(2)
-        case .quantized(let keys, _, _, _, _):
-            return keys.0.dim(-2)
-        }
-    }
 }
 
 private func gemma4AdjustAttentionMask(
@@ -569,23 +567,8 @@ private final class Gemma4TextExperts: Module {
             x.reshaped(batch * length, hidden),
             topKIndices.reshaped(batch * length, topK)
         )
-        let weights = topKWeights.reshaped(batch * length, topK, 1).asType(expertOutput.dtype)
-        return (expertOutput * weights).sum(axis: -2).reshaped(batch, length, hidden)
-    }
-}
-
-private final class Gemma4ScaledLinear: Module, UnaryLayer {
-    @ModuleInfo(key: "weight") var weight: MLXArray
-    let scalar: Float
-
-    init(inFeatures: Int, outFeatures: Int, scalar: Float) {
-        self.scalar = scalar
-        self._weight.wrappedValue = MLXArray.zeros([outFeatures, inFeatures])
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        (x.matmul(weight.transposed())) * scalar
+        let weights = topKWeights.reshaped(batch * length, topK).asType(expertOutput.dtype)
+        return weightedExpertSum(expertOutput, weights).reshaped(batch, length, hidden)
     }
 }
 
@@ -865,13 +848,14 @@ private final class Gemma4TextBackbone: Module {
     let firstSlidingCacheIdx: Int
     let embedScale: Float
     let embedTokensPerLayerScale: Float
+    let perLayerProjectionScale: Float
     private let _perLayerInputScale: MLXArray
 
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     @ModuleInfo(key: "layers") var layers: [Gemma4TextDecoderLayer]
     @ModuleInfo(key: "norm") var norm: Gemma4RMSNormZeroShift
     @ModuleInfo(key: "embed_tokens_per_layer") var embedTokensPerLayer: Embedding?
-    @ModuleInfo(key: "per_layer_model_projection") var perLayerModelProjection: Gemma4ScaledLinear?
+    @ModuleInfo(key: "per_layer_model_projection") var perLayerModelProjection: Linear?
     @ModuleInfo(key: "per_layer_projection_norm") var perLayerProjectionNorm:
         Gemma4RMSNormZeroShift?
 
@@ -907,17 +891,20 @@ private final class Gemma4TextBackbone: Module {
         self._norm.wrappedValue = Gemma4RMSNormZeroShift(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
         if config.hiddenSizePerLayerInput > 0 {
+            self.perLayerProjectionScale = pow(Float(config.hiddenSize), -0.5)
             self._embedTokensPerLayer.wrappedValue = Embedding(
                 embeddingCount: config.vocabularySizePerLayerInput,
                 dimensions: config.hiddenLayers * config.hiddenSizePerLayerInput
             )
-            self._perLayerModelProjection.wrappedValue = Gemma4ScaledLinear(
-                inFeatures: config.hiddenSize,
-                outFeatures: config.hiddenLayers * config.hiddenSizePerLayerInput,
-                scalar: pow(Float(config.hiddenSize), -0.5)
+            self._perLayerModelProjection.wrappedValue = Linear(
+                config.hiddenSize,
+                config.hiddenLayers * config.hiddenSizePerLayerInput,
+                bias: false
             )
             self._perLayerProjectionNorm.wrappedValue = Gemma4RMSNormZeroShift(
                 dimensions: config.hiddenSizePerLayerInput, eps: config.rmsNormEps)
+        } else {
+            self.perLayerProjectionScale = 1.0
         }
 
         super.init()
@@ -945,7 +932,7 @@ private final class Gemma4TextBackbone: Module {
             return nil
         }
 
-        var perLayerProjection = perLayerModelProjection(inputsEmbeds)
+        var perLayerProjection = perLayerModelProjection(inputsEmbeds) * perLayerProjectionScale
         perLayerProjection = perLayerProjection.reshaped(
             Array(inputsEmbeds.shape.dropLast()) + [
                 config.hiddenLayers, config.hiddenSizePerLayerInput,
@@ -968,6 +955,18 @@ private final class Gemma4TextBackbone: Module {
         cache: [KVCache?]? = nil,
         perLayerInputs: MLXArray? = nil
     ) -> MLXArray {
+        // Tolerate callers that hand us a 1D `(L,)` token array instead
+        // of the canonical 2D `(B, L)` produced by `Gemma4Processor.prepare`.
+        // The downstream `perLayerInputs` indexing path (`finalPerLayerInputs[
+        // 0..., 0..., idx, 0...]`) requires 4D shapes; with 1D inputs the
+        // model otherwise crashes inside `MLXArray.subscript.getter`
+        // → `mlx_array_dim` → `_mlx_error`. This expansion is zero-copy
+        // and behaves identically when the caller already passed 2D.
+        let inputs = inputs.map { $0.ndim == 1 ? $0.expandedDimensions(axis: 0) : $0 }
+        let inputsEmbeds = inputsEmbeds.map {
+            $0.ndim == 2 ? $0.expandedDimensions(axis: 0) : $0
+        }
+
         let h0: MLXArray
         if let inputsEmbeds {
             h0 = inputsEmbeds
@@ -1485,7 +1484,8 @@ private final class Gemma4VisionPooler: Module {
 
         let actualPositions = patchPositions[0, ..<validCount]
         let maxX = Int(actualPositions[0..., 0].max().item(Int32.self)) + 1
-        let kernel = Int(sqrt(Double(max(1, validCount / max(length, 1)))))
+        let kernel = gemma4VisionPoolingKernel(
+            paddedPatchCount: pooledHiddenStates.dim(1), outputLength: length)
         let divisor = max(kernel * kernel, 1)
         let pooledLength = max(length, 1)
 
