@@ -25,7 +25,7 @@ Unit tests run without any special hardware and do not download models.
 Note: `swift test` [does not work yet](https://github.com/ml-explore/mlx-swift?tab=readme-ov-file#xcodebuild) — use `xcodebuild` instead:
 
 ```bash
-xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS'
+xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS' -skipPackagePluginValidation
 ```
 
 Integration tests verify end-to-end model loading and generation. They require
@@ -40,17 +40,26 @@ test target (`Cmd+U` or via the Test Navigator), or use `xcodebuild`:
 xcodebuild test \
   -project IntegrationTesting/IntegrationTesting.xcodeproj \
   -scheme IntegrationTesting \
-  -destination 'platform=macOS'
+  -destination 'platform=macOS' \
+  -skipPackagePluginValidation
 
 # Run a single test
 xcodebuild test \
   -project IntegrationTesting/IntegrationTesting.xcodeproj \
   -scheme IntegrationTesting \
   -destination 'platform=macOS' \
+  -skipPackagePluginValidation \
   -only-testing:IntegrationTestingTests/ToolCallIntegrationTests/qwen35FormatAutoDetection\(\)
 ```
 
 See [Libraries/IntegrationTestHelpers/README.md](Libraries/IntegrationTestHelpers/README.md) for more details.
+
+CI also verifies that DocC documentation builds without warnings for every
+library target. Run the same check locally with:
+
+```bash
+scripts/verify-docs.sh
+```
 
 ## Issues
 
