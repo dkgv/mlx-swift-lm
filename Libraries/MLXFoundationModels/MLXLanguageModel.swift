@@ -711,9 +711,9 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             switch kind {
             case .greedy:
                 return .greedy
-            case .top(let k, _):
+            case .randomTopK(let k, _):
                 return .topK(k)
-            case .nucleus(let threshold, _):
+            case .randomProbabilityThreshold(let threshold, _):
                 return .nucleus(threshold)
             @unknown default:
                 return nil
