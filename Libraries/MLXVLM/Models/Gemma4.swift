@@ -2550,6 +2550,22 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
         return logits.logits
     }
 
+    /// MTP-aware `LanguageModel` entry point. Reads `mtpEmitFlagKey` from
+    /// the incoming `state` and threads it through to `Gemma4TextLanguageModel`;
+    /// the returned `LMOutput` carries `mtpLastHiddenStatesKey` and
+    /// `mtpSharedKVStatesKey` populated when the flag is set, empty otherwise.
+    /// Overrides the protocol-extension default at `LanguageModel` which
+    /// would discard `state`. Mirrors `Gemma4.callAsFunction(_:cache:state:)`.
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        let emit = state?[mtpEmitFlagKey] ?? false
+        return languageModel(
+            input.tokens, cache: cache?.map { $0 },
+            emitDrafterState: emit
+        )
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var filtered: [String: MLXArray] = [:]
         filtered.reserveCapacity(weights.count)
@@ -2569,6 +2585,30 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
         }
         return languageModel.sanitize(weights: filtered)
     }
+}
+
+// MARK: - MTP drafter target access
+
+/// A Gemma 4 - family VLM whose text stack is the shared
+/// `Gemma4TextBackbone`. The MTP drafter
+/// (`Gemma4AssistantDraftModel.draftBlock`) casts its `target` to this
+/// protocol instead of dispatching on concrete classes, so it stays agnostic
+/// of which Gemma 4 variant wraps the backbone.
+///
+/// Declared in this file so the conformances can reach the classes' private
+/// `languageModel` without widening its visibility.
+protocol Gemma4BackboneProviding {
+    /// The text backbone whose `embedTokens` / `embedScale` the drafter
+    /// shares with the target.
+    var textBackbone: Gemma4TextBackbone { get }
+}
+
+extension Gemma4: Gemma4BackboneProviding {
+    var textBackbone: Gemma4TextBackbone { languageModel.model }
+}
+
+extension Gemma4Unified: Gemma4BackboneProviding {
+    var textBackbone: Gemma4TextBackbone { languageModel.model }
 }
 
 // MARK: - Processor
