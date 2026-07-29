@@ -230,29 +230,47 @@ final class Qwen35GatedDeltaNet: Module {
         mask: MLXArray? = nil,
         cache: MambaCache? = nil
     ) -> MLXArray {
-        let B = inputs.dim(0)
-        let S = inputs.dim(1)
-
-        var qkv = inProjQKV(inputs)
-        let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(inputs)
-        let a = inProjA(inputs)
-
-        let convState: MLXArray
-        if let cacheState = cache?[0] {
-            convState = cacheState
-        } else {
-            convState = MLXArray.zeros([B, convKernelSize - 1, convDim], dtype: inputs.dtype)
+        let convState =
+            cache?[0] ?? zeroStates(batch: inputs.dim(0), dtype: inputs.dtype).conv
+        let (out, newConvState, newRecState) = forward(
+            inputs, convState: convState, recState: cache?[1], mask: mask)
+        if let cache {
+            cache[0] = newConvState
+            cache[1] = newRecState
+            cache.advance(inputs.dim(1))
         }
+        return out
+    }
+
+    /// Zero conv/recurrent state — the shapes `callAsFunction` and
+    /// `gatedDeltaUpdate` otherwise build implicitly, made explicit for the
+    /// traced decode path.
+    func zeroStates(batch: Int, dtype: DType) -> (conv: MLXArray, rec: MLXArray) {
+        (
+            MLXArray.zeros([batch, convKernelSize - 1, convDim], dtype: dtype),
+            MLXArray.zeros([batch, numVHeads, headVDim, headKDim], dtype: .float32)
+        )
+    }
+
+    /// The GDN body with state passed explicitly in and out so it can be
+    /// traced.
+    func forward(
+        _ x: MLXArray, convState: MLXArray, recState: MLXArray?, mask: MLXArray?
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let B = x.dim(0)
+        let S = x.dim(1)
+
+        var qkv = inProjQKV(x)
+        let z = inProjZ(x).reshaped(B, S, numVHeads, headVDim)
+        let b = inProjB(x)
+        let a = inProjA(x)
 
         if let mask {
             qkv = MLX.where(mask[.ellipsis, .newAxis], qkv, 0)
         }
 
         let convInput = concatenated([convState, qkv], axis: 1)
-        if let cache {
-            cache[0] = contiguous(convInput[0..., (-(convKernelSize - 1))..., 0...])
-        }
+        let newConvState = contiguous(convInput[0..., (-(convKernelSize - 1))..., 0...])
 
         let convOut = silu(conv1d(convInput))
 
@@ -261,7 +279,6 @@ final class Qwen35GatedDeltaNet: Module {
         let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        var state = cache?[1]
         let dtype = q.dtype
         let invScale = pow(Float(headKDim), -0.5)
         let qNormed =
@@ -271,9 +288,7 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        var out: MLXArray
-
-        (out, state) = gatedDeltaUpdate(
+        let (out, newRecState) = gatedDeltaUpdate(
             q: qNormed,
             k: kNormed,
             v: v,
@@ -281,17 +296,12 @@ final class Qwen35GatedDeltaNet: Module {
             b: b,
             aLog: aLog,
             dtBias: dtBias,
-            state: state,
+            state: recState,
             mask: mask
         )
 
-        if let cache {
-            cache[1] = state
-            cache.advance(S)
-        }
-
-        out = norm(out, gate: z)
-        return outProj(out.reshaped(B, S, -1))
+        let gated = norm(out, gate: z)
+        return (outProj(gated.reshaped(B, S, -1)), newConvState, newRecState)
     }
 }
 
@@ -345,6 +355,28 @@ final class Qwen35Attention: Module {
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
+        let (q, gate, k, values) = projectPreRope(x)
+
+        let offset = cache?.ropeOffset
+        let queries = applyRotaryPosition(rope, to: q, offset: offset)
+        let keys = applyRotaryPosition(rope, to: k, offset: offset)
+
+        let output = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: scale,
+            mask: mask
+        )
+
+        return mergeHeadsAndProject(attention: output, gate: gate)
+    }
+
+    /// Projections up to (not including) rope: `x` → (queries, gate, keys,
+    /// values). Rope stays outside the traced decode path on purpose: its
+    /// offset moves every token, and a trace would bake it in as a constant.
+    func projectPreRope(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
         let B = x.dim(0)
         let L = x.dim(1)
 
@@ -360,22 +392,16 @@ final class Qwen35Attention: Module {
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
-        let offset = cache?.ropeOffset
-        queries = applyRotaryPosition(rope, to: queries, offset: offset)
-        keys = applyRotaryPosition(rope, to: keys, offset: offset)
+        return (queries, gate, keys, values)
+    }
 
-        let output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
-
-        return oProj(sigmoidMultiply(output, gate))
+    /// Attention tail: head merge → output gate → output projection.
+    func mergeHeadsAndProject(attention: MLXArray, gate: MLXArray) -> MLXArray {
+        let merged =
+            attention
+            .transposed(0, 2, 1, 3)
+            .reshaped(attention.dim(0), attention.dim(2), -1)
+        return oProj(sigmoidMultiply(merged, gate))
     }
 }
 
@@ -412,6 +438,34 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        // Decode (S == 1) runs through a compiled trace: fusion merges the
+        // elementwise chains into fewer kernels, bit-identically. Prefill
+        // stays unfused — it is GEMM-bound and would pay a trace per shape.
+        if x.dim(1) != 1 {
+            return forward(x)
+        }
+        compileLock.lock()
+        if compiledForward == nil {
+            // [unowned self]: stored only on self, so it cannot outlive self;
+            // a strong capture would cycle and leak the module, weights and
+            // compiled tape (pinned by Qwen35CompiledDecodeLifecycleTests).
+            // The trace bakes the weights it captured — recreate the module
+            // rather than swapping parameters on a live one.
+            compiledForward = compile { [unowned self] x in forward(x) }
+        }
+        let fn = compiledForward!
+        compileLock.unlock()
+        return fn(x)
+    }
+
+    /// Compiled functions are created on first decode, not at init (the
+    /// weights aren't loaded yet), so the lazy assignment needs a lock.
+    private let compileLock = NSLock()
+    private var compiledForward: ((MLXArray) -> MLXArray)?
+
+    /// The uncompiled body; an enclosing layer trace inlines it rather than
+    /// nesting this block's own compiled wrapper.
+    func forward(_ x: MLXArray) -> MLXArray {
         var gates = gate(x)
         gates = MLX.softmax(gates, axis: -1, precise: true)
 
@@ -434,6 +488,13 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 }
 
 // MARK: - Decoder Layer
+
+/// Caches the compiled decode path can drive: their attention is the plain
+/// `cache.update` + SDPA route in `attentionWithCacheUpdate`. Quantized and
+/// turbo caches have their own routes and take the general path.
+private func hasPlainAttentionRoute(_ cache: KVCache) -> Bool {
+    !(cache is QuantizedKVCacheProtocol) && !(cache is TurboQuantKVCache)
+}
 
 final class Qwen35DecoderLayer: Module {
     let isLinear: Bool
@@ -482,6 +543,18 @@ final class Qwen35DecoderLayer: Module {
         ssmMask: MLXArray?,
         cache: KVCache?
     ) -> MLXArray {
+        // Single-token unmasked decode runs the layer as one traced function
+        // (two for full attention, split at the KV write). Everything else
+        // takes the general body below.
+        if x.dim(1) == 1, ssmMask == nil {
+            if isLinear, let mambaCache = cache as? MambaCache {
+                return decodeLinearLayer(x, cache: mambaCache)
+            }
+            if !isLinear, let cache, hasPlainAttentionRoute(cache) {
+                return decodeAttentionLayer(x, mask: attentionMask, cache: cache)
+            }
+        }
+
         let r: MLXArray
         if isLinear {
             r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache)
@@ -491,6 +564,116 @@ final class Qwen35DecoderLayer: Module {
 
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+    }
+
+    // MARK: - Compiled decode blocks
+
+    // Lock rationale: see Qwen35SparseMoeBlock.compileLock.
+    private let compileLock = NSLock()
+    private var compiledLinearLayer: (([MLXArray]) -> [MLXArray])?
+    private var compiledAttentionPre: (([MLXArray]) -> [MLXArray])?
+    private var compiledAttentionPost: (([MLXArray]) -> [MLXArray])?
+
+    /// GDN decode layer as one traced function. A compiled function must be
+    /// pure, so conv/recurrent state crosses the boundary explicitly.
+    private func decodeLinearLayer(_ x: MLXArray, cache: MambaCache) -> MLXArray {
+        let zero = linearAttn!.zeroStates(batch: x.dim(0), dtype: x.dtype)
+        let convState = cache[0] ?? zero.conv
+        let recState = cache[1] ?? zero.rec
+
+        compileLock.lock()
+        if compiledLinearLayer == nil {
+            // [unowned self]: see Qwen35SparseMoeBlock.callAsFunction.
+            compiledLinearLayer = compile { [unowned self] args in
+                let (out, newConvState, newRecState) = linearLayerBody(
+                    x: args[0], convState: args[1], recState: args[2])
+                return [out, newConvState, newRecState]
+            }
+        }
+        let fn = compiledLinearLayer!
+        compileLock.unlock()
+
+        let out = fn([x, convState, recState])
+        cache[0] = out[1]
+        cache[1] = out[2]
+        cache.advance(1)
+        return out[0]
+    }
+
+    /// Full-attention decode layer: two traced functions around the KV write,
+    /// which cannot live inside a trace because the cache grows every token.
+    private func decodeAttentionLayer(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache
+    ) -> MLXArray {
+        compileLock.lock()
+        if compiledAttentionPre == nil {
+            compiledAttentionPre = compile { [unowned self] args in
+                let (queries, gate, keys, values) = attentionPreBody(x: args[0])
+                return [queries, gate, keys, values]
+            }
+        }
+        if compiledAttentionPost == nil {
+            compiledAttentionPost = compile { [unowned self] args in
+                [attentionPostBody(x: args[0], attention: args[1], gate: args[2])]
+            }
+        }
+        let pre = compiledAttentionPre!
+        let post = compiledAttentionPost!
+        compileLock.unlock()
+
+        let projected = pre([x])
+        let attention = attentionCacheStep(
+            queries: projected[0], keys: projected[2], values: projected[3],
+            cache: cache, mask: mask)
+        return post([x, attention, projected[1]])[0]
+    }
+
+    /// The part of a full-attention decode step that cannot be traced: rope
+    /// (its offset moves every token), the KV write, and the SDPA over the
+    /// grown cache.
+    func attentionCacheStep(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        cache: KVCache, mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray {
+        let attn = selfAttn!
+        let offset = cache.ropeOffset
+        return attentionWithCacheUpdate(
+            queries: applyRotaryPosition(attn.rope, to: queries, offset: offset),
+            keys: applyRotaryPosition(attn.rope, to: keys, offset: offset),
+            values: values,
+            cache: cache,
+            scale: attn.scale,
+            mask: mask
+        )
+    }
+
+    // MARK: - Layer bodies
+
+    func linearLayerBody(x: MLXArray, convState: MLXArray, recState: MLXArray) -> (
+        MLXArray, MLXArray, MLXArray
+    ) {
+        let (r, newConvState, newRecState) = linearAttn!.forward(
+            inputLayerNorm(x), convState: convState, recState: recState, mask: nil)
+        let h = x + r
+        return (h + mlpForward(postAttentionLayerNorm(h)), newConvState, newRecState)
+    }
+
+    func attentionPreBody(x: MLXArray) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+        selfAttn!.projectPreRope(inputLayerNorm(x))
+    }
+
+    /// `x` is the layer input — the residual branch around the attention block.
+    func attentionPostBody(x: MLXArray, attention: MLXArray, gate: MLXArray) -> MLXArray {
+        let r = selfAttn!.mergeHeadsAndProject(attention: attention, gate: gate)
+        let h = x + r
+        return h + mlpForward(postAttentionLayerNorm(h))
+    }
+
+    private func mlpForward(_ x: MLXArray) -> MLXArray {
+        if let moe = mlp as? Qwen35SparseMoeBlock {
+            return moe.forward(x)
+        }
+        return (mlp as! UnaryLayer)(x)
     }
 }
 
@@ -513,19 +696,28 @@ public class Qwen35TextModelInner: Module {
             dimensions: args.hiddenSize
         )
 
-        self.layers = (0 ..< args.hiddenLayers).map { layerIdx in
+        let layers = (0 ..< args.hiddenLayers).map { layerIdx in
             Qwen35DecoderLayer(args, layerIdx: layerIdx)
         }
+        self.layers = layers
 
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
         self.ssmIdx = 0
         self.faIdx = args.fullAttentionInterval - 1
 
+        let segments = Self.decodeSchedule(for: layers)
+        self.decodeSegments = segments
+        self.compiledSegments = Array(repeating: nil, count: segments.count)
+
         super.init()
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
+        if inputs.dim(1) == 1, let caches = cache, let step = decodeStep(inputs, caches) {
+            return step
+        }
+
         var hiddenStates = embedTokens(inputs)
 
         var cacheArray = cache
@@ -546,6 +738,154 @@ public class Qwen35TextModelInner: Module {
         }
 
         return norm(hiddenStates)
+    }
+
+    // MARK: - Whole-step decode schedule
+
+    /// One traced piece of a decode step: the tail of the previous
+    /// full-attention layer, a run of GDN layers, then the head of the next
+    /// one (whose SDPA runs between this segment and the next).
+    private struct DecodeSegment {
+        var attentionPostLayer: Int?
+        var linearLayers: [Int] = []
+        var attentionPreLayer: Int?
+
+        /// First conv/recurrent state slot in the input list (after `x` and
+        /// any [attention, gate] pair).
+        var stateInputOffset: Int { attentionPostLayer == nil ? 1 : 3 }
+        /// First [queries, gate, keys, values] slot in the output list.
+        var attentionOutputOffset: Int { 1 + 2 * linearLayers.count }
+    }
+
+    private let decodeSegments: [DecodeSegment]
+    // Lock rationale: see Qwen35SparseMoeBlock.compileLock.
+    private let compileLock = NSLock()
+    private var compiledSegments: [(([MLXArray]) -> [MLXArray])?]
+
+    private static func decodeSchedule(for layers: [Qwen35DecoderLayer]) -> [DecodeSegment] {
+        var segments: [DecodeSegment] = []
+        var current = DecodeSegment()
+        for (i, layer) in layers.enumerated() {
+            if layer.isLinear {
+                current.linearLayers.append(i)
+            } else {
+                current.attentionPreLayer = i
+                segments.append(current)
+                current = DecodeSegment(attentionPostLayer: i)
+            }
+        }
+        segments.append(current)
+        return segments
+    }
+
+    /// Flat argument/result lists because `compile` takes `[MLXArray]`.
+    /// In: `[x]` (token ids for segment 0), then `[attention, gate]` when
+    /// opening with a full-attention tail, then `[convState, recState]` per
+    /// GDN layer. Out: `[x]`, then `[newConvState, newRecState]` per GDN
+    /// layer, then `[queries, gate, keys, values]` when closing with a head.
+    private func segmentBody(at index: Int, _ args: [MLXArray]) -> [MLXArray] {
+        let segment = decodeSegments[index]
+        var hiddenStates = index == 0 ? embedTokens(args[0]) : args[0]
+
+        if let post = segment.attentionPostLayer {
+            hiddenStates = layers[post].attentionPostBody(
+                x: hiddenStates, attention: args[1], gate: args[2])
+        }
+
+        var states: [MLXArray] = []
+        for (i, layerIndex) in segment.linearLayers.enumerated() {
+            let slot = segment.stateInputOffset + 2 * i
+            let (out, newConvState, newRecState) = layers[layerIndex].linearLayerBody(
+                x: hiddenStates, convState: args[slot], recState: args[slot + 1])
+            hiddenStates = out
+            states.append(newConvState)
+            states.append(newRecState)
+        }
+
+        if let pre = segment.attentionPreLayer {
+            let (queries, gate, keys, values) = layers[pre].attentionPreBody(x: hiddenStates)
+            // The next segment needs the attention layer's input for its residual.
+            return [hiddenStates] + states + [queries, gate, keys, values]
+        }
+
+        if index == decodeSegments.count - 1 {
+            hiddenStates = norm(hiddenStates)
+        }
+        return [hiddenStates] + states
+    }
+
+    /// One decode step through the compiled segments, or nil when this is not
+    /// the plain single-token case the schedule assumes — the caller then
+    /// takes the general path. Segments split at each KV write: the cache
+    /// update's in-place slice_update cannot live inside a trace, and
+    /// everything else on a decode step is static-shaped, so the segments
+    /// compile concretely.
+    private func decodeStep(_ inputs: MLXArray, _ cache: [KVCache?]) -> MLXArray? {
+        guard cache.count == layers.count else { return nil }
+        // The schedule is only valid when the masks the general path would
+        // build both come out empty.
+        if createSSMMask(h: inputs, cache: cache[ssmIdx] as? MambaCache) != nil { return nil }
+        guard let faCache = cache[faIdx],
+            case .none = createAttentionMask(h: inputs, cache: faCache)
+        else { return nil }
+
+        // Cache kinds can change mid-generation (`maybeQuantizeKVCache` swaps
+        // array entries), so eligibility is re-checked every step.
+        var mambaCaches = [MambaCache?](repeating: nil, count: layers.count)
+        for (i, layer) in layers.enumerated() {
+            if layer.isLinear {
+                // No GDN state yet (a single-token prompt): the general path
+                // builds the zero states.
+                guard let mambaCache = cache[i] as? MambaCache, mambaCache[0] != nil,
+                    mambaCache[1] != nil
+                else { return nil }
+                mambaCaches[i] = mambaCache
+            } else {
+                guard let kv = cache[i], hasPlainAttentionRoute(kv) else { return nil }
+            }
+        }
+
+        var carry = inputs
+        var pendingAttention: [MLXArray] = []
+
+        for (segmentIndex, segment) in decodeSegments.enumerated() {
+            var args: [MLXArray] = [carry] + pendingAttention
+            for layerIndex in segment.linearLayers {
+                let mambaCache = mambaCaches[layerIndex]!
+                args.append(mambaCache[0]!)
+                args.append(mambaCache[1]!)
+            }
+
+            compileLock.lock()
+            if compiledSegments[segmentIndex] == nil {
+                // [unowned self]: see Qwen35SparseMoeBlock.callAsFunction.
+                compiledSegments[segmentIndex] = compile { [unowned self] segmentArgs in
+                    segmentBody(at: segmentIndex, segmentArgs)
+                }
+            }
+            let fn = compiledSegments[segmentIndex]!
+            compileLock.unlock()
+            let outputs = fn(args)
+
+            carry = outputs[0]
+            for (i, layerIndex) in segment.linearLayers.enumerated() {
+                let mambaCache = mambaCaches[layerIndex]!
+                mambaCache[0] = outputs[1 + 2 * i]
+                mambaCache[1] = outputs[2 + 2 * i]
+                mambaCache.advance(1)
+            }
+
+            pendingAttention = []
+            if let pre = segment.attentionPreLayer {
+                let head = segment.attentionOutputOffset
+                let attention = layers[pre].attentionCacheStep(
+                    queries: outputs[head], keys: outputs[head + 2],
+                    values: outputs[head + 3], cache: cache[pre]!, mask: .none)
+                pendingAttention = [attention, outputs[head + 1]]
+            }
+        }
+
+        return carry
     }
 }
 
