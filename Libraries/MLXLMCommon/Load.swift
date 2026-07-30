@@ -32,6 +32,18 @@ package func safetensorWeightURLs(in modelDirectory: URL) throws -> [URL] {
     }
 }
 
+/// The weight files a load should read.
+///
+/// A shard only materialises the weight files its own layers live in, so `model.safetensors.index.json`
+/// will name files this device never fetched. Those are skipped for a shard load. A full load keeps
+/// every entry, so a genuinely missing file still surfaces as an open failure rather than turning
+/// into a confusing missing-parameter error later.
+package func weightURLsToLoad(in modelDirectory: URL, isShardLoad: Bool) throws -> [URL] {
+    let urls = try safetensorWeightURLs(in: modelDirectory)
+    guard isShardLoad else { return urls }
+    return urls.filter { FileManager.default.fileExists(atPath: $0.path) }
+}
+
 /// Load model weights.
 ///
 /// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
@@ -58,7 +70,7 @@ public func loadWeights(
     // load the weights and collect metadata from the first safetensor file
     var weights = [String: MLXArray]()
     var metadata = [String: String]()
-    for url in try safetensorWeightURLs(in: modelDirectory) {
+    for url in try weightURLsToLoad(in: modelDirectory, isShardLoad: keyFilter != nil) {
         let (w, m) = try loadArraysAndMetadata(url: url)
         for (key, value) in w {
             weights[key] = value
