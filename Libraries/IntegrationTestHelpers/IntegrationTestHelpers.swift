@@ -2,13 +2,16 @@
 // Integration packages inject their own Downloader and TokenizerLoader, then call
 // these functions which run the test and throw on failure.
 
-import CoreImage
 import Foundation
 import MLX
 import MLXEmbedders
 import MLXLLM
 import MLXLMCommon
 import MLXVLM
+
+#if canImport(CoreImage)
+import CoreImage
+#endif
 
 // Both MLXLMCommon and MLXEmbedders define ModelContainer.
 public typealias LLModelContainer = MLXLMCommon.ModelContainer
@@ -26,6 +29,43 @@ public struct IntegrationTestFailure: LocalizedError {
 
 private func check(_ condition: Bool, _ message: String) throws {
     guard condition else { throw IntegrationTestFailure(message) }
+}
+
+// MARK: - Network Retry
+
+/// Transient network failures worth retrying on a flaky CI network — chiefly
+/// `-1005 networkConnectionLost`, which surfaced mid-download in CI.
+private func isTransientNetworkError(_ error: Error) -> Bool {
+    guard let urlError = error as? URLError else { return false }
+    switch urlError.code {
+    case .networkConnectionLost, .timedOut, .cannotConnectToHost,
+        .notConnectedToInternet, .dnsLookupFailed, .cannotFindHost,
+        .resourceUnavailable, .badServerResponse:
+        return true
+    default:
+        return false
+    }
+}
+
+/// Run `operation`, retrying a few times with linear backoff on transient
+/// network errors. Non-network errors (and the final attempt) rethrow.
+private func withNetworkRetry<T>(
+    _ label: String, attempts: Int = 3, _ operation: () async throws -> T
+) async throws -> T {
+    var lastError: Error?
+    for attempt in 1 ... attempts {
+        do {
+            return try await operation()
+        } catch {
+            lastError = error
+            guard isTransientNetworkError(error), attempt < attempts else { throw error }
+            print(
+                "Transient network error loading \(label) "
+                    + "(attempt \(attempt)/\(attempts)): \(error). Retrying…")
+            try? await Task.sleep(nanoseconds: UInt64(attempt) * 2_000_000_000)
+        }
+    }
+    throw lastError ?? IntegrationTestFailure("\(label): retry loop exited unexpectedly")
 }
 
 // MARK: - Model IDs
@@ -69,16 +109,27 @@ public actor IntegrationTestModels {
         let tokenizerLoader = self.tokenizerLoader
         let task = Task {
             print("Loading LLM: \(key)")
-            let container = try await LLMModelFactory.shared.loadContainer(
-                from: downloader, using: tokenizerLoader,
-                configuration: configuration,
-                progressHandler: logProgress(key)
-            )
+            let container = try await withNetworkRetry(key) {
+                try await LLMModelFactory.shared.loadContainer(
+                    from: downloader, using: tokenizerLoader,
+                    configuration: configuration,
+                    progressHandler: logProgress(key)
+                )
+            }
             print("Loaded LLM: \(key)")
             return container
         }
         llmTasksByName[key] = task
         return try await task.value
+    }
+
+    /// Drop the cached container for `configuration` so ARC can free its
+    /// GPU-resident weights between tests. Pair with `GPU.clearCache()` at the
+    /// call site to release the freed buffers back to the system — without this,
+    /// loading many large models in one serialized run accumulates weights until
+    /// the process is jetsammed (Metal compiler XPC failures / crashes).
+    public func evictLLM(_ configuration: ModelConfiguration) {
+        llmTasksByName[configuration.name] = nil
     }
 
     /// Load an arbitrary VLM container, cached by `configuration.name` so the same
@@ -125,6 +176,15 @@ public actor IntegrationTestModels {
         }
         embeddingTask = task
         return try await task.value
+    }
+}
+
+// MARK: - Vision Test Images
+
+/// A solid-color square image for vision smoke tests.
+public enum VisionTestImages {
+    public static func solidColor(_ color: CIColor, size: CGFloat = 100) -> CIImage {
+        CIImage(color: color).cropped(to: CGRect(x: 0, y: 0, width: size, height: size))
     }
 }
 
@@ -176,9 +236,9 @@ public enum ChatSessionTests {
     }
 
     public static func visionModel(container: LLModelContainer) async throws {
+        #if canImport(CoreImage)
         let session = ChatSession(container, generateParameters: generateParameters)
-        let redImage = CIImage(color: .red).cropped(
-            to: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let redImage = VisionTestImages.solidColor(.red)
 
         let result = try await streamAndCollect(
             session.streamResponse(
@@ -188,6 +248,10 @@ public enum ChatSessionTests {
             result.lowercased().contains("red"),
             "Expected 'red' in response, got: \(result)"
         )
+        #else
+        fatalError(
+            "Vision model test requires CoreImage, which is not available on this platform.")
+        #endif
     }
 
     public static func streamDetailsWithTools(container: LLModelContainer) async throws {
@@ -764,7 +828,11 @@ public enum ToolCallTests {
             let lmInput = try await context.processor.prepare(input: input)
             let stream = try generate(
                 input: lmInput,
-                parameters: GenerateParameters(maxTokens: maxTokens),
+                // temperature: 0 (greedy) so tool-call generation is deterministic.
+                // The default sampling temperature makes these end-to-end checks
+                // flaky — the model may emit no tool call or malformed arguments on
+                // some runs (matches the temperature: 0 used by the coherence/MTP tests).
+                parameters: GenerateParameters(maxTokens: maxTokens, temperature: 0),
                 context: context
             )
             var text = ""
@@ -863,3 +931,176 @@ private let timeToolSchema: ToolSpec = [
 ]
 
 private let multiToolSchemas: [ToolSpec] = [weatherToolSchema, timeToolSchema]
+
+// MARK: - Hugging Face cache locations
+
+/// Returns the root directory for Hugging Face caches (`~/.cache/huggingface`).
+///
+/// `FileManager.homeDirectoryForCurrentUser` is unavailable on iOS, so this helper
+/// falls back to `NSHomeDirectory()`. On macOS that resolves to the real user home
+/// (matching the `huggingface_hub` Python client's default cache layout); on iOS it
+/// resolves to the app sandbox home, where these integration tests do not normally run
+/// but where the path is at least addressable for callers that pre-populate caches.
+public func hfCacheDir() -> URL {
+    URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        .appendingPathComponent(".cache/huggingface", isDirectory: true)
+}
+
+/// Returns the local snapshot directory for `modelId` inside the Hugging Face hub cache,
+/// following the `models--{owner}--{name}/snapshots/{rev}` layout written by `huggingface_hub`.
+/// When `revision` is `nil` (the default) picks the first entry under `snapshots/` — sufficient
+/// for the usual single-revision case.
+/// When `revision` is non-nil, returns that specific snapshot directory if it exists.
+/// Returns `nil` when the model (or the requested revision) is not present in the cache.
+public func hfSnapshotDir(modelId: String, revision: String? = nil) -> URL? {
+    let folderName = "models--" + modelId.replacingOccurrences(of: "/", with: "--")
+    let snapshots = hfCacheDir()
+        .appendingPathComponent("hub", isDirectory: true)
+        .appendingPathComponent(folderName, isDirectory: true)
+        .appendingPathComponent("snapshots", isDirectory: true)
+    if let revision {
+        let pinned = snapshots.appendingPathComponent(revision, isDirectory: true)
+        var isDir: ObjCBool = false
+        guard
+            FileManager.default.fileExists(atPath: pinned.path, isDirectory: &isDir),
+            isDir.boolValue
+        else { return nil }
+        return pinned
+    }
+    guard
+        let entries = try? FileManager.default.contentsOfDirectory(
+            at: snapshots, includingPropertiesForKeys: nil)
+    else { return nil }
+    return entries.first
+}
+
+// MARK: - Dataset download
+
+public enum IntegrationTestDatasetError: LocalizedError {
+    case listingFailed(repo: String, statusCode: Int)
+    case downloadFailed(file: String, statusCode: Int)
+    case noFilesMatched(repo: String, patterns: [String])
+
+    public var errorDescription: String? {
+        switch self {
+        case .listingFailed(let repo, let statusCode):
+            return "Failed to list files for dataset '\(repo)' (HTTP \(statusCode))"
+        case .downloadFailed(let file, let statusCode):
+            return "Failed to download '\(file)' from dataset (HTTP \(statusCode))"
+        case .noFilesMatched(let repo, let patterns):
+            return "No files in dataset '\(repo)' matched patterns \(patterns)"
+        }
+    }
+}
+
+/// Download a public Hugging Face dataset snapshot to a per-revision local cache.
+///
+/// Lists files via `huggingface.co/api/datasets/{repo}/tree/{revision}`, then
+/// downloads each file matching `patterns` (or all files if `patterns` is empty)
+/// from `huggingface.co/datasets/{repo}/resolve/{revision}/{file}`. Files are
+/// written to `~/.cache/huggingface/integration-test-datasets/{repo}/{revision}/`.
+/// Already-cached files are reused without a second HTTP fetch.
+///
+/// Pattern syntax: simple shell-style glob with `*` matching any sequence
+/// (including `/`). Examples: `"masks/*.safetensors"`, `"*.json"`, `"foo/bar"`.
+///
+/// Returns the snapshot directory URL; callers build per-file paths by
+/// appending the file path (e.g. `snapshotDir.appendingPathComponent("masks/q1.safetensors")`).
+///
+/// Tests using this helper should catch thrown errors and skip via
+/// `Issue.record(...)` rather than propagate — network unavailability or HF
+/// outages should not surface as parity-test failures.
+public func downloadDataset(
+    repo: String,
+    revision: String,
+    matching patterns: [String] = []
+) async throws -> URL {
+    let cacheRoot = hfCacheDir()
+        .appendingPathComponent("integration-test-datasets", isDirectory: true)
+    let snapshotDir =
+        cacheRoot
+        .appendingPathComponent(repo, isDirectory: true)
+        .appendingPathComponent(revision, isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: snapshotDir, withIntermediateDirectories: true)
+
+    let host = URL(string: "https://huggingface.co")!
+    let treeBase = host.appendingPathComponent("api/datasets/\(repo)/tree/\(revision)")
+    var treeComponents = URLComponents(url: treeBase, resolvingAgainstBaseURL: false)!
+    treeComponents.queryItems = [URLQueryItem(name: "recursive", value: "true")]
+    let treeURL = treeComponents.url!
+    var request = URLRequest(url: treeURL)
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    let (treeData, treeResp) = try await URLSession.shared.data(for: request)
+    let treeStatus = (treeResp as? HTTPURLResponse)?.statusCode ?? 0
+    guard treeStatus == 200 else {
+        throw IntegrationTestDatasetError.listingFailed(repo: repo, statusCode: treeStatus)
+    }
+
+    struct TreeEntry: Decodable {
+        let type: String
+        let path: String
+    }
+    let entries = try JSONDecoder().decode([TreeEntry].self, from: treeData)
+    let matched =
+        entries
+        .filter { $0.type == "file" }
+        .map(\.path)
+        .filter { path in
+            patterns.isEmpty
+                || patterns.contains { datasetPathMatches(path, glob: $0) }
+        }
+    guard !matched.isEmpty else {
+        throw IntegrationTestDatasetError.noFilesMatched(repo: repo, patterns: patterns)
+    }
+
+    for file in matched {
+        let dest = snapshotDir.appendingPathComponent(file)
+        if FileManager.default.fileExists(atPath: dest.path) { continue }
+        try FileManager.default.createDirectory(
+            at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let fileURL = host.appendingPathComponent("datasets/\(repo)/resolve/\(revision)/\(file)")
+        let (tmp, resp) = try await URLSession.shared.download(from: fileURL)
+        let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else {
+            try? FileManager.default.removeItem(at: tmp)
+            throw IntegrationTestDatasetError.downloadFailed(file: file, statusCode: status)
+        }
+        // Concurrent callers may have populated `dest` between the existence
+        // check above and this move. Accept the lost race instead of erroring.
+        do {
+            try FileManager.default.moveItem(at: tmp, to: dest)
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+            if !FileManager.default.fileExists(atPath: dest.path) {
+                throw error
+            }
+        }
+    }
+
+    return snapshotDir
+}
+
+private func datasetPathMatches(_ path: String, glob pattern: String) -> Bool {
+    let parts = pattern.split(separator: "*", omittingEmptySubsequences: false).map(String.init)
+    if parts.count == 1 { return path == pattern }
+    var cursor = path.startIndex
+    for (i, part) in parts.enumerated() {
+        if part.isEmpty {
+            if i == 0 || i == parts.count - 1 { continue }
+            continue
+        }
+        if i == 0 {
+            guard path[cursor...].hasPrefix(part) else { return false }
+            cursor = path.index(cursor, offsetBy: part.count)
+        } else if i == parts.count - 1 {
+            return path[cursor...].hasSuffix(part)
+        } else {
+            guard let r = path.range(of: part, range: cursor ..< path.endIndex) else {
+                return false
+            }
+            cursor = r.upperBound
+        }
+    }
+    return true
+}

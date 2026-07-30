@@ -798,10 +798,15 @@ public struct Qwen25VLProcessor: UserInputProcessor {
 
         // image_processing_qwen2_vl._preprocess
         let size = images[0].extent.size
+        let factor = config.patchSize * config.mergeSize
+        // Qwen2.5-VL ships a very large max_pixels; default to the budget the
+        // model card recommends (1280 * 28 * 28), override-able via `processing`.
+        let maxPixels = processing?.maxPixels ?? min(config.size.maxPixels, 1280 * factor * factor)
         let (resizedHeight, resizedWidth) = try QwenVL.targetSize(
             height: Int(size.height), width: Int(size.width),
-            factor: config.patchSize * config.mergeSize,
-            minPixels: config.size.minPixels, maxPixels: config.size.maxPixels)
+            factor: factor,
+            minPixels: processing?.minPixels ?? config.size.minPixels,
+            maxPixels: maxPixels)
         let resizedSize = CGSize(width: resizedWidth, height: resizedHeight)
 
         let processedImages =
@@ -861,7 +866,7 @@ public struct Qwen25VLProcessor: UserInputProcessor {
                 ) { frame in
                     // first apply the user requested resizing, etc. if any
                     let resizedImage = MediaProcessing.apply(
-                        frame.frame, processing: input.processing)
+                        try frame.image.asCIImage(), processing: input.processing)
                     if resizedSize == .zero {
                         let size = resizedImage.extent.size
                         let (resizedHeight, resizedWidth) = try QwenVL.targetSize(
@@ -872,7 +877,7 @@ public struct Qwen25VLProcessor: UserInputProcessor {
                     }
                     let processedImage = preprocessVideoFrame(
                         image: resizedImage, resizedSize: resizedSize)
-                    return VideoFrame(frame: processedImage, timeStamp: frame.timeStamp)
+                    return VideoFrame(image: .ciImage(processedImage), timeStamp: frame.timeStamp)
                 }
 
                 videosAsImageSequences.append(imageSequence.frames)
@@ -974,7 +979,9 @@ public class Qwen25VL: Module, VLMModel, KVCacheDimensionProvider {
         return (mergedEmbeds, positionIds, ropeDeltas)
     }
 
-    public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
+    public func prepare(
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, windowSize: Int?
+    ) throws
         -> PrepareResult
     {
         let dtype = visionModel.patchEmbed.proj.weight.dtype
@@ -1348,6 +1355,14 @@ public struct Qwen25VLConfiguration: Codable, Sendable {
         // these are overlaid in the top level
         self.textConfiguration = try TextConfiguration(from: decoder)
         self.baseConfiguration = try BaseConfiguration(from: decoder)
+    }
+}
+
+extension Qwen25VLConfiguration: ModelConfigurationValidating {
+    public func validateModelConfiguration() throws {
+        try validateMROPESection(
+            textConfiguration.ropeScaling,
+            context: "Qwen25VLConfiguration.text_config.rope_scaling")
     }
 }
 

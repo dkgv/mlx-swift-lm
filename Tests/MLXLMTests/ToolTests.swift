@@ -3,6 +3,41 @@ import MLXLMCommon
 import Testing
 
 struct ToolTests {
+    @Test("ToolCallProcessor drains calls once in parse order")
+    func toolCallProcessorPublicDrain() {
+        let processor = ToolCallProcessor(format: .json)
+        _ = processor.processChunk(
+            #"<tool_call>{"name":"first","arguments":{}}</tool_call><tool_call>{"name":"second","arguments":{}}</tool_call>"#
+        )
+
+        #expect(processor.drainToolCalls().map(\.function.name) == ["first", "second"])
+        #expect(processor.drainToolCalls().isEmpty)
+    }
+
+    @Test("ToolCallProcessor ordered outputs retain split call-text-call order")
+    func toolCallProcessorOrderedSplitOutput() {
+        let processor = ToolCallProcessor(format: .json)
+        #expect(
+            processor.processChunkOutputs(
+                #"<tool_call>{"name":"first","arguments":{"#
+            ).isEmpty)
+
+        let outputs = processor.processChunkOutputs(
+            #"}}</tool_call>between<tool_call>{"name":"second","arguments":{}}</tool_call>"#)
+        #expect(outputs.count == 3)
+        guard case .toolCall(let first) = outputs[0] else {
+            Issue.record("Expected first call")
+            return
+        }
+        #expect(first.function.name == "first")
+        #expect(outputs[1] == .response("between"))
+        guard case .toolCall(let second) = outputs[2] else {
+            Issue.record("Expected second call")
+            return
+        }
+        #expect(second.function.name == "second")
+    }
+
     @Test("Test Weather Tool Schema Generation")
     func testWeatherToolSchemaGeneration() throws {
         struct WeatherInput: Codable {
@@ -479,6 +514,52 @@ struct ToolTests {
         #expect(toolCall.function.arguments["unit"] == .string("celsius"))
     }
 
+    @Test("Test Pythonic Tool Call Parser - Object Wrapper Argument (LFM2)")
+    func testPythonicParserObjectWrapperArgument() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        // LFM2 emits the full parameter object under a `properties` wrapper key.
+        // The object also contains a comma the old `[^,\)]+` value regex truncated on.
+        let content =
+            "<|tool_call_start|>[get_weather(properties={\"location\": \"Tokyo\", \"unit\": \"celsius\"})]<|tool_call_end|>"
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "get_weather",
+                    "parameters": [
+                        "properties": [
+                            "location": ["type": "string"],
+                            "unit": ["type": "string"],
+                        ]
+                    ],
+                ] as [String: any Sendable]
+            ]
+        ]
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Tokyo"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test Pythonic Tool Call Parser - Object-Valued Argument Preserved")
+    func testPythonicParserObjectValuedArgument() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        // A non-wrapper key is not unwrapped; the object value (with its inner
+        // comma) is parsed intact rather than truncated.
+        let content =
+            "<|tool_call_start|>[configure(settings={\"width\": 10, \"height\": 20})]<|tool_call_end|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "configure")
+        #expect(
+            toolCall.function.arguments["settings"]
+                == .object(["width": .int(10), "height": .int(20)]))
+    }
+
     @Test("Test Pythonic Tool Call Parser - Double Quotes")
     func testPythonicParserDoubleQuotes() throws {
         let parser = PythonicToolCallParser(
@@ -807,6 +888,36 @@ struct ToolTests {
         #expect(toolCall.function.arguments["query"] == .string("hello, world!"))
     }
 
+    @Test("Test Gemma 4 Function Parser - Type Conversion")
+    func testGemma4ParserTypeConversion() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "mail_read",
+                    "parameters": [
+                        "properties": [
+                            "account": ["type": "string"],
+                            "mailbox": ["type": "string"],
+                            "id": ["type": "integer"],
+                        ]
+                    ],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content =
+            #"<|tool_call>call:mail_read{account:<|"|>me@example.com<|"|>,mailbox:<|"|>INBOX<|"|>,id:<|"|>158348<|"|>}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(toolCall.function.name == "mail_read")
+        #expect(toolCall.function.arguments["account"] == .string("me@example.com"))
+        #expect(toolCall.function.arguments["mailbox"] == .string("INBOX"))
+        #expect(toolCall.function.arguments["id"] == .int(158_348))
+        #expect(toolCall.function.arguments["id"] != .string("158348"))
+    }
+
     @Test("Test Gemma Format via ToolCallProcessor")
     func testGemmaFormatProcessor() throws {
         let processor = ToolCallProcessor(format: .gemma)
@@ -1000,6 +1111,10 @@ struct ToolTests {
         #expect(ToolCallFormat.infer(from: "qwen3_next_moe") == .xmlFunction)
         #expect(ToolCallFormat.infer(from: "QWEN3_NEXT") == .xmlFunction)
 
+        // Nanbeige models (prefix matching)
+        #expect(ToolCallFormat.infer(from: "nanbeige") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "NANBEIGE") == .xmlFunction)
+
         // Mistral3 models (prefix matching)
         #expect(ToolCallFormat.infer(from: "mistral3") == .mistral)
         #expect(ToolCallFormat.infer(from: "Mistral3") == .mistral)
@@ -1059,6 +1174,7 @@ struct ToolTests {
 
         let toolCall = try #require(parser.parse(content: content, tools: nil))
 
+        #expect(toolCall.id == "abc123xyz")
         #expect(toolCall.function.name == "get_weather")
         #expect(toolCall.function.arguments["location"] == .string("Paris"))
     }

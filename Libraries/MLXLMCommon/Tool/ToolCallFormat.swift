@@ -135,6 +135,18 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         }
     }
 
+    /// Generate an ID compatible with this tool-call syntax.
+    func generateToolCallID() -> String {
+        let uuid = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+
+        switch self {
+        case .mistral:
+            return String(uuid.prefix(9))
+        default:
+            return "call_" + uuid.lowercased()
+        }
+    }
+
     /// Infer the tool call format based on model type from config.json.
     ///
     /// This method maps known model types to their corresponding tool call formats,
@@ -201,6 +213,12 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
 
         // Qwen3-Next family (qwen3_next, etc.)
         if type.hasPrefix("qwen3_next") {
+            return .xmlFunction
+        }
+
+        // Nanbeige4.2+ — chat template supports XML and JSON; XML is the trained
+        // default and the model card's recommendation for agentic use
+        if type.hasPrefix("nanbeige") {
             return .xmlFunction
         }
 

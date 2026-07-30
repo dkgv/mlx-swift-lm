@@ -185,8 +185,19 @@ public struct BaseConfiguration: Codable, Sendable {
         }
     }
 
+    private struct TextConfiguration: Codable, Sendable {
+        var eosTokenIds: IntOrIntArray?
+
+        enum CodingKeys: String, CodingKey {
+            case eosTokenIds = "eos_token_id"
+        }
+    }
+
     /// Internal storage for quantization details extracted from `config.json`.
     var quantizationContainer: QuantizationContainer?
+
+    /// Text-model metadata nested by composite model configurations.
+    private var textConfiguration: TextConfiguration?
 
     /// EOS token IDs from config.json. Can be a single Int or an array of Ints.
     public var eosTokenIds: IntOrIntArray?
@@ -194,6 +205,11 @@ public struct BaseConfiguration: Codable, Sendable {
     /// Whether the embedding matrix is reused (transposed) as the LM-head projection.
     /// Absent in many configs; defaults to false.
     public var tieWordEmbeddings: Bool?
+
+    /// EOS token IDs declared at either the model root or in `text_config`.
+    public var effectiveEOSTokenIds: Set<Int> {
+        Set(eosTokenIds?.values ?? textConfiguration?.eosTokenIds?.values ?? [])
+    }
 
     /// The default quantization settings.
     @available(*, deprecated, message: "Please use perLayerQuantization instead")
@@ -209,6 +225,7 @@ public struct BaseConfiguration: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case quantizationContainer = "quantization"
+        case textConfiguration = "text_config"
         case eosTokenIds = "eos_token_id"
         case tieWordEmbeddings = "tie_word_embeddings"
     }
