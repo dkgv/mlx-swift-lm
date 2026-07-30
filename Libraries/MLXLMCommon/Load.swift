@@ -53,8 +53,12 @@ public func loadWeights(
     }
 
     // quantize if needed
+    //
+    // `quantizePartial` rather than `quantize`: with a key filter only this shard's layers have
+    // scales, so only they are quantized, and a shard starting above layer zero would otherwise
+    // hand `update(modules:)` a `layers` array with leading holes and trap.
     if quantization != nil || perLayerQuantization != nil {
-        quantize(model: model) { path, module in
+        quantizePartial(model: model) { path, module in
             if weights["\(path).scales"] != nil {
                 if let perLayerQuantization {
                     return perLayerQuantization.quantization(layer: path)?.asTuple
