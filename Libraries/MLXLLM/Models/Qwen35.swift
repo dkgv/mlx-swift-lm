@@ -659,7 +659,7 @@ final class Qwen35DecoderLayer: Module {
         // Single-token unmasked decode runs the layer as one traced function
         // (two for full attention, split at the KV write). Everything else
         // takes the general body below.
-        if x.dim(1) == 1, ssmMask == nil {
+        if x.dim(1) == 1, ssmMask == nil, !mlpIsStreaming {
             if isLinear, let mambaCache = cache as? MambaCache {
                 return decodeLinearLayer(x, cache: mambaCache)
             }
@@ -680,6 +680,16 @@ final class Qwen35DecoderLayer: Module {
     }
 
     // MARK: - Compiled decode blocks
+
+    /// Whether this layer's MoE serves its experts on demand.
+    ///
+    /// Streaming reads the router's picks back to the host in the middle of the
+    /// forward pass, and an eval inside a trace traps. The block's own guard
+    /// only keeps it from compiling itself — every enclosing trace has to be
+    /// skipped too, because the layer bodies inline `mlpForward`.
+    var mlpIsStreaming: Bool {
+        (mlp as? Qwen35SparseMoeBlock)?.switchMLP.isStreaming ?? false
+    }
 
     // Lock rationale: see Qwen35SparseMoeBlock.compileLock.
     private let compileLock = NSLock()
@@ -935,6 +945,9 @@ public class Qwen35TextModelInner: Module {
     /// compile concretely.
     private func decodeStep(_ inputs: MLXArray, _ cache: [KVCache?]) -> MLXArray? {
         guard cache.count == layers.count else { return nil }
+        // Segments inline the layer bodies, so a streamed MoE would eval inside
+        // the segment trace. See Qwen35DecoderLayer.mlpIsStreaming.
+        if layers.contains(where: \.mlpIsStreaming) { return nil }
         // The schedule is only valid when the masks the general path would
         // build both come out empty.
         if createSSMMask(h: inputs, cache: cache[ssmIdx] as? MambaCache) != nil { return nil }
