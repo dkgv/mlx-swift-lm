@@ -544,7 +544,12 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         // Decode (S == 1) runs through a compiled trace: fusion merges the
         // elementwise chains into fewer kernels, bit-identically. Prefill
         // stays unfused — it is GEMM-bound and would pay a trace per shape.
-        if x.dim(1) != 1 {
+        //
+        // Streamed experts never compile: the roster is read back to the host
+        // mid-forward, so which weights the gather sees is data-dependent and a
+        // trace would bake in whichever experts the first token happened to
+        // route to.
+        if x.dim(1) != 1 || switchMLP.isStreaming {
             return forward(x)
         }
         compileLock.lock()

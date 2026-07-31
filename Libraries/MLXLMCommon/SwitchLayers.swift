@@ -107,8 +107,13 @@ public class SwitchGLU: Module {
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
 
-        let xUp = upProj(x, idx, sortedIndices: doSort)
-        let xGate = gateProj(x, idx, sortedIndices: doSort)
+        // One roster for all three projections: they route identically, so
+        // compacting once keeps their stacked weights on a shared numbering.
+        let roster = isStreaming ? ExpertRoster.make(from: idx) : nil
+        let gatherIdx = roster?.compactIndices ?? idx
+
+        let xUp = upProj(x, gatherIdx, sortedIndices: doSort, roster: roster)
+        let xGate = gateProj(x, gatherIdx, sortedIndices: doSort, roster: roster)
         let activated =
             if let activationProduct {
                 activationProduct(xGate, xUp)
@@ -117,14 +122,34 @@ public class SwitchGLU: Module {
             }
         x = downProj(
             activated,
-            idx,
-            sortedIndices: doSort)
+            gatherIdx,
+            sortedIndices: doSort,
+            roster: roster)
 
         if doSort {
             x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)
         }
 
         return MLX.squeezed(x, axis: -2)
+    }
+
+    /// Whether this block's experts are supplied on demand rather than held
+    /// resident. See ``SwitchLinear/expertProvider``.
+    public var isStreaming: Bool {
+        gateProj.expertProvider != nil
+    }
+
+    /// Switches all three projections to demand-loaded experts.
+    ///
+    /// - Parameters:
+    ///   - provider: Serves the slices for every projection.
+    ///   - path: This block's module path, e.g.
+    ///     `language_model.model.layers.7.mlp.switch_mlp`. Each projection is
+    ///     registered under `path` plus its own key.
+    public func enableExpertStreaming(provider: any ExpertWeightProviding, path: String) {
+        gateProj.enableExpertStreaming(provider: provider, path: "\(path).gate_proj")
+        upProj.enableExpertStreaming(provider: provider, path: "\(path).up_proj")
+        downProj.enableExpertStreaming(provider: provider, path: "\(path).down_proj")
     }
 }
 
@@ -227,6 +252,18 @@ public class SwitchLinear: Module, Quantizable {
     let outputDims: Int
     let numExperts: Int
 
+    /// Supplies expert slices per forward pass instead of holding the full
+    /// stack resident. When set, ``weight`` (and, on the quantized subclass,
+    /// ``scales``/``biases``) is ignored and may be a placeholder — a shard
+    /// that streams never loads the real parameter at all.
+    ///
+    /// Set together with ``expertPath``; both are required for streaming.
+    public var expertProvider: (any ExpertWeightProviding)?
+
+    /// This layer's module path, which the provider uses to locate the
+    /// checkpoint tensor backing it.
+    public var expertPath: String?
+
     public init(inputDims: Int, outputDims: Int, numExperts: Int, bias: Bool = true) {
         self.inputDims = inputDims
         self.outputDims = outputDims
@@ -263,9 +300,11 @@ public class SwitchLinear: Module, Quantizable {
     }
 
     public func callAsFunction(
-        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
+        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false,
+        roster: ExpertRoster? = nil
     ) -> MLXArray {
-        let weightT = self.weight.swappedAxes(-1, -2)
+        let weight = streamedWeights(roster: roster)?.weight ?? self.weight
+        let weightT = weight.swappedAxes(-1, -2)
         var result = MLX.gatherMM(x, weightT, rhsIndices: indices, sortedIndices: sortedIndices)
 
         if let bias = self.bias {
@@ -273,6 +312,46 @@ public class SwitchLinear: Module, Quantizable {
         }
 
         return result
+    }
+
+    /// Switches this layer to demand-loaded experts and drops the resident
+    /// stack.
+    ///
+    /// The stacked parameters are replaced with single-expert placeholders. A
+    /// shard that calls this before its first forward pass never materialises
+    /// the real ones: they are lazy until evaluated, and nothing evaluates them
+    /// once the streaming path is taking over the gather.
+    ///
+    /// - Parameters:
+    ///   - provider: Serves the slices. Preflighted by the caller.
+    ///   - path: This layer's module path, e.g.
+    ///     `language_model.model.layers.7.mlp.switch_mlp.gate_proj`.
+    public func enableExpertStreaming(provider: any ExpertWeightProviding, path: String) {
+        self.expertProvider = provider
+        self.expertPath = path
+        releaseResidentExperts()
+    }
+
+    /// Swaps the stacked parameters for one-expert stand-ins. Shapes past the
+    /// expert axis are preserved so anything inspecting the layer still sees a
+    /// coherent module; the values are never read.
+    func releaseResidentExperts() {
+        var placeholders = [("weight", Self.oneExpert(like: weight))]
+        if let bias {
+            placeholders.append(("bias", Self.oneExpert(like: bias)))
+        }
+        _ = update(parameters: ModuleParameters.unflattened(placeholders))
+    }
+
+    static func oneExpert(like array: MLXArray) -> MLXArray {
+        MLXArray.zeros([1] + array.shape.dropFirst(), dtype: array.dtype)
+    }
+
+    /// The slices for `roster`, or `nil` when this layer holds its experts
+    /// resident.
+    func streamedWeights(roster: ExpertRoster?) -> StackedExpertWeights? {
+        guard let expertProvider, let expertPath, let roster else { return nil }
+        return expertProvider.stackedExperts(path: expertPath, experts: roster.experts)
     }
 
     public func toQuantized(groupSize: Int = 64, bits: Int = 4, mode: QuantizationMode) -> Module {
@@ -309,13 +388,15 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     }
 
     override public func callAsFunction(
-        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
+        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false,
+        roster: ExpertRoster? = nil
     ) -> MLXArray {
+        let streamed = streamedWeights(roster: roster)
         var result = MLX.gatherQuantizedMM(
             x,
-            self.weight,
-            scales: self.scales,
-            biases: self.biases,
+            streamed?.weight ?? self.weight,
+            scales: streamed?.scales ?? self.scales,
+            biases: streamed?.biases ?? self.biases,
             rhsIndices: indices,
             transpose: true,
             groupSize: self.groupSize,
@@ -329,5 +410,14 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         }
 
         return result
+    }
+
+    override func releaseResidentExperts() {
+        super.releaseResidentExperts()
+        var placeholders = [("scales", Self.oneExpert(like: scales))]
+        if let biases {
+            placeholders.append(("biases", Self.oneExpert(like: biases)))
+        }
+        _ = update(parameters: ModuleParameters.unflattened(placeholders))
     }
 }
